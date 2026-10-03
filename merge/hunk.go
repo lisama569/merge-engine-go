@@ -32,13 +32,17 @@ func spansOverlap(a, b hunkSpan) bool {
 	return a.start <= b.end && b.start <= a.end
 }
 
-// hunkConflict checks every hunk of change A against every hunk of change
-// B on the same file. It returns the first overlapping pair's evidence,
-// or nil when the edits are disjoint and may auto-merge.
-func hunkConflict(path string, a, b model.Change, sideA, sideB string) *model.Conflict {
-	for _, ha := range a.Hunks {
+// conflictingHunkPairs compares every hunk of change A against every hunk
+// of change B on the same file. It returns the indices of the hunks on
+// each side that overlap a non-identical hunk of the other side, plus one
+// human-readable evidence line per conflicting pair. Identical hunks
+// (duplicate application of the same edit) never count as conflicts.
+func conflictingHunkPairs(a, b model.Change, sideA, sideB string) (confA, confB map[int]bool, evidence []string) {
+	confA = map[int]bool{}
+	confB = map[int]bool{}
+	for ia, ha := range a.Hunks {
 		sa := spanOf(ha)
-		for _, hb := range b.Hunks {
+		for ib, hb := range b.Hunks {
 			sb := spanOf(hb)
 			if !spansOverlap(sa, sb) {
 				continue
@@ -47,23 +51,19 @@ func hunkConflict(path string, a, b model.Change, sideA, sideB string) *model.Co
 			if sameHunkEdit(ha, hb) {
 				continue
 			}
-			return &model.Conflict{
-				Kind:  model.ConflictTextOverlap,
-				Path:  path,
-				SideA: sideA,
-				SideB: sideB,
-				Detail: fmt.Sprintf(
-					"both sides edit base lines [%d,%d] vs [%d,%d]",
-					ha.OldStart, ha.OldEnd, hb.OldStart, hb.OldEnd),
-				Evidence: []string{
-					fmt.Sprintf("side %s hunk base [%d,%d] -> %d replacement line(s)", sideA, ha.OldStart, ha.OldEnd, len(ha.NewLines)),
-					fmt.Sprintf("side %s hunk base [%d,%d] -> %d replacement line(s)", sideB, hb.OldStart, hb.OldEnd, len(hb.NewLines)),
-					"ranges intersect on the base file; engine refuses to pick either side",
-				},
-			}
+			confA[ia] = true
+			confB[ib] = true
+			evidence = append(evidence, fmt.Sprintf(
+				"side %s hunk base [%d,%d] -> %d line(s) overlaps side %s hunk base [%d,%d] -> %d line(s)",
+				sideA, ha.OldStart, ha.OldEnd, len(ha.NewLines),
+				sideB, hb.OldStart, hb.OldEnd, len(hb.NewLines)))
 		}
 	}
-	return nil
+	if len(evidence) > 0 {
+		evidence = append(evidence,
+			"ranges intersect on the base file; engine refuses to pick either side")
+	}
+	return confA, confB, evidence
 }
 
 // sameHunkEdit reports whether two hunks express the identical edit

@@ -124,6 +124,9 @@ func MergeSets(base *model.Snapshot, sides ...*model.ChangeSet) *model.MergeResu
 	}
 
 	// Pass 2: per-source reconciliation over deterministic key order.
+	// accepted collects the concrete changes that may be auto-applied;
+	// conflicting paths contribute nothing here.
+	var accepted []sideChange
 	keys := make([]string, 0, len(bySource))
 	for k := range bySource {
 		keys = append(keys, k)
@@ -136,9 +139,10 @@ func MergeSets(base *model.Snapshot, sides ...*model.ChangeSet) *model.MergeResu
 		if d.conflict != nil {
 			// Avoid duplicating conflicts already found in pass 1.
 			result.Conflicts = appendConflictIfNew(result.Conflicts, *d.conflict)
-			continue
 		}
-		result.Applied = append(result.Applied, d.applied...)
+		// Note: accepted may be non-empty even on conflict (hunk-granular
+		// partial acceptance); the clean hunks still merge.
+		accepted = append(accepted, d.accepted...)
 	}
 
 	// Pass 3: target-path collisions (add/add, rename destination clashes,
@@ -155,23 +159,20 @@ func MergeSets(base *model.Snapshot, sides ...*model.ChangeSet) *model.MergeResu
 		}
 		if c := targetCollision(t, group, renameSources); c != nil {
 			result.Conflicts = appendConflictIfNew(result.Conflicts, *c)
-			// Drop any applied add/rename already recorded for this target
+			// Drop any accepted add/rename already recorded for this target
 			// or its (renamed) source so the merged tree stays conservative.
-			result.Applied = removeAppliedForConflict(result.Applied, c)
+			accepted = removeAcceptedForConflict(accepted, c)
 		}
 	}
 
-	if len(result.Conflicts) == 0 {
-		result.OK = true
-		applyToSnapshot(result.Merged, ordered)
-	} else {
-		result.OK = false
-		// Keep the merged tree equal to the base on conflict: the engine
-		// never silently writes a guessed merge.
-		result.Merged = base.Clone()
-		result.Applied = nil
-		sortConflicts(result.Conflicts)
-	}
+	// Conflict and auto-merge coexist in one result: every accepted change
+	// is applied to the merged snapshot even when other paths conflicted;
+	// only the conflicting paths keep their base state. OK reports whether
+	// the merge was fully automatic.
+	result.OK = len(result.Conflicts) == 0
+	sortConflicts(result.Conflicts)
+	result.Applied = appliedFromAccepted(accepted)
+	applyAccepted(result.Merged, accepted)
 	return result
 }
 
@@ -246,54 +247,102 @@ func targetCollision(target string, group []sideChange, renameSources map[string
 	}
 }
 
-// applyToSnapshot performs the accepted changes against a clone of base.
-// It is only called when there are zero conflicts.
-func applyToSnapshot(snap *model.Snapshot, sides []*model.ChangeSet) {
+// appliedFromAccepted derives the public Applied records from the accepted
+// changes, preserving their (already deterministic) order.
+func appliedFromAccepted(accepted []sideChange) []model.AppliedChange {
+	if len(accepted) == 0 {
+		return nil
+	}
+	out := make([]model.AppliedChange, 0, len(accepted))
+	for _, sc := range accepted {
+		out = append(out, model.AppliedChange{
+			SourceID: sc.side, Path: sc.ch.Path, Op: sc.ch.Op})
+	}
+	return out
+}
+
+// applyAccepted applies only the accepted (non-conflicting) changes to the
+// merged snapshot. File-level ops are applied first in deterministic
+// (path, op, side) order; modify hunks are then grouped per path and
+// applied in a single base-relative pass, so hunks from several sides
+// combine correctly and identical hunks collapse (idempotent replay).
+func applyAccepted(snap *model.Snapshot, accepted []sideChange) {
 	if snap.Files == nil {
 		snap.Files = map[string]string{}
 	}
-	// Side order is already deterministic; within one side preserve order.
-	for _, cs := range sides {
-		for _, ch := range cs.Changes {
-			switch ch.Op {
-			case model.OpAdd:
-				snap.Files[ch.Path] = ch.NewContent
-			case model.OpDelete:
+	var fileOps []sideChange
+	modHunks := map[string][]model.Hunk{}
+	for _, sc := range accepted {
+		if sc.ch.Op == model.OpModify {
+			modHunks[sc.ch.Path] = append(modHunks[sc.ch.Path], sc.ch.Hunks...)
+			continue
+		}
+		fileOps = append(fileOps, sc)
+	}
+	sort.SliceStable(fileOps, func(i, j int) bool {
+		a, b := fileOps[i], fileOps[j]
+		if a.ch.Path != b.ch.Path {
+			return a.ch.Path < b.ch.Path
+		}
+		if a.ch.Op != b.ch.Op {
+			return a.ch.Op < b.ch.Op
+		}
+		return a.side < b.side
+	})
+	for _, sc := range fileOps {
+		ch := sc.ch
+		switch ch.Op {
+		case model.OpAdd:
+			snap.Files[ch.Path] = ch.NewContent
+		case model.OpDelete:
+			delete(snap.Files, ch.Path)
+		case model.OpRename:
+			cur, ok := snap.Files[ch.OldPath]
+			if !ok {
+				// Idempotency guard: the source is gone and the destination
+				// already exists, so this rename was applied before
+				// (validation-style re-merge); re-applying must not clobber
+				// the destination content.
+				if _, done := snap.Files[ch.Path]; done {
+					continue
+				}
+			}
+			if ok {
+				delete(snap.Files, ch.OldPath)
+			}
+			if ch.NewContent != "" {
+				cur = ch.NewContent
+			}
+			snap.Files[ch.Path] = cur
+		case model.OpTypeChange:
+			if ch.ChangeType == "file_to_dir" {
 				delete(snap.Files, ch.Path)
-			case model.OpModify:
-				cur := snap.Files[ch.Path]
-				snap.Files[ch.Path] = applyHunks(cur, ch.Hunks)
-			case model.OpRename:
-				cur, ok := snap.Files[ch.OldPath]
-				if ok {
-					delete(snap.Files, ch.OldPath)
-				}
-				if ch.NewContent != "" {
-					cur = ch.NewContent
-				}
-				snap.Files[ch.Path] = cur
-			case model.OpTypeChange:
-				if ch.ChangeType == "file_to_dir" {
-					delete(snap.Files, ch.Path)
-					snap.Files[ch.Path+"/"] = ""
-				} else {
-					delete(snap.Files, ch.Path+"/")
-					snap.Files[ch.Path] = ch.NewContent
-				}
+				snap.Files[ch.Path+"/"] = ""
+			} else {
+				delete(snap.Files, ch.Path+"/")
+				snap.Files[ch.Path] = ch.NewContent
 			}
 		}
 	}
+	paths := make([]string, 0, len(modHunks))
+	for p := range modHunks {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		snap.Files[p] = applyHunks(snap.Files[p], modHunks[p])
+	}
 }
 
-func removeAppliedForConflict(applied []model.AppliedChange, c *model.Conflict) []model.AppliedChange {
-	out := applied[:0]
-	for _, a := range applied {
-		if a.SourceID == c.SideA || a.SourceID == c.SideB {
-			if a.Path == c.Path {
-				continue
-			}
+// removeAcceptedForConflict drops accepted changes that participate in the
+// given conflict (matching side and post-image path).
+func removeAcceptedForConflict(accepted []sideChange, c *model.Conflict) []sideChange {
+	out := accepted[:0]
+	for _, sc := range accepted {
+		if (sc.side == c.SideA || sc.side == c.SideB) && sc.ch.Path == c.Path {
+			continue
 		}
-		out = append(out, a)
+		out = append(out, sc)
 	}
 	return out
 }

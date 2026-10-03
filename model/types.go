@@ -15,10 +15,11 @@ const (
 
 // Hunk is one line-range edit inside a file.
 // Line numbers are 1-based and inclusive on both ends.
-// For pure insertions OldStart==OldEnd denotes the insertion anchor line
-// and the span covers OldEnd-OldStart+1 original lines; an insertion uses
-// OldCount==0 expressed as OldStart==OldEnd (anchor semantics are checked
-// by ingest validation).
+// A pure insertion carries no OldLines and anchors on a single base
+// position: OldStart==OldEnd means "insert before that base line"
+// (OldStart==0 inserts before the first line / into an empty file, and
+// OldStart==len(base)+1 appends at end of file). The anchor is zero-width,
+// so an insertion's declared old-line count is 0.
 type Hunk struct {
 	OldStart int      `json:"old_start"`
 	OldEnd   int      `json:"old_end"`

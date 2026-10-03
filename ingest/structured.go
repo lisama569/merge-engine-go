@@ -128,6 +128,16 @@ func convertHunk(sh StructuredHunk, ci, hi int) (model.Hunk, error) {
 	if sh.OldStart > 0 {
 		oldCount = sh.OldEnd - sh.OldStart + 1
 	}
+	// Pure insertion: the hunk carries no old lines and anchors on a single
+	// base position (OldStart==OldEnd, or 0 for an empty file / before the
+	// first line). The anchor is zero-width, so the declared old-line count
+	// is 0 even when OldStart==OldEnd>0. Any other shape with empty
+	// old_lines (e.g. OldStart<OldEnd) stays a hunk_length_mismatch below,
+	// so malformed records are never silently treated as insertions.
+	insertion := len(sh.OldLines) == 0 && sh.OldStart == sh.OldEnd
+	if insertion {
+		oldCount = 0
+	}
 	newCount := 0
 	if sh.NewStart > 0 {
 		newCount = sh.NewEnd - sh.NewStart + 1

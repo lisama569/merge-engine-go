@@ -14,8 +14,10 @@ type sideChange struct {
 }
 
 // fileDecisions holds everything concluded for one path during a merge.
+// accepted carries the concrete changes that may be auto-applied (already
+// deduplicated: identical changes from several sides appear once).
 type fileDecisions struct {
-	applied  []model.AppliedChange
+	accepted []sideChange
 	conflict *model.Conflict
 }
 
@@ -35,8 +37,7 @@ func reconcilePath(key string, group []sideChange, baseExisted bool) fileDecisio
 
 	// Fast path: single side touches this file -> auto-apply.
 	if len(group) == 1 {
-		return fileDecisions{applied: []model.AppliedChange{{
-			SourceID: group[0].side, Path: group[0].ch.Path, Op: group[0].ch.Op}}}
+		return fileDecisions{accepted: []sideChange{group[0]}}
 	}
 
 	// Multi-side: classify by op set.
@@ -51,8 +52,7 @@ func reconcileMulti(key string, g []sideChange, baseExisted bool) fileDecisions 
 
 	// All sides identical (same op + same target) -> dedupe once.
 	if identicalChanges(g) {
-		return fileDecisions{applied: []model.AppliedChange{{
-			SourceID: g[0].side, Path: g[0].ch.Path, Op: g[0].ch.Op}}}
+		return fileDecisions{accepted: []sideChange{g[0]}}
 	}
 
 	switch {
@@ -107,8 +107,7 @@ func addAddConflict(key string, g []sideChange) fileDecisions {
 	}
 	if len(contents) == 1 {
 		// Identical add: apply once, record first side.
-		return fileDecisions{applied: []model.AppliedChange{{
-			SourceID: g[0].side, Path: key, Op: model.OpAdd}}}
+		return fileDecisions{accepted: []sideChange{g[0]}}
 	}
 	return fileDecisions{conflict: &model.Conflict{
 		Kind: model.ConflictAddAdd, Path: key,
@@ -172,8 +171,7 @@ func renameFamilyConflict(key string, g []sideChange) fileDecisions {
 	}
 	if len(distinct) == 1 && len(renames) == len(g) {
 		// Every side performs the same rename: idempotent auto-apply.
-		return fileDecisions{applied: []model.AppliedChange{{
-			SourceID: renames[0].side, Path: renames[0].ch.Path, Op: model.OpRename}}}
+		return fileDecisions{accepted: []sideChange{renames[0]}}
 	}
 	return fileDecisions{conflict: &model.Conflict{
 		Kind: model.ConflictRenameRename, Path: key,
@@ -192,21 +190,82 @@ func typeConflict(key string, g []sideChange) fileDecisions {
 	}}
 }
 
+// modifyPair reconciles several sides modifying the same file. Overlapping
+// hunks conflict, but the conflict is hunk-granular: hunks that interfere
+// with nothing are still accepted as partial modifies, so one bad overlap
+// never rolls the whole file (or the whole merge) back to base.
 func modifyPair(key string, g []sideChange) fileDecisions {
+	conflicted := make([]map[int]bool, len(g))
+	for i := range g {
+		conflicted[i] = map[int]bool{}
+	}
+	var evidence []string
+	var firstA, firstB int
+	var firstHunk [2]model.Hunk
+	hasConflict := false
 	for i := 0; i < len(g); i++ {
 		for j := i + 1; j < len(g); j++ {
-			if c := hunkConflict(key, g[i].ch, g[j].ch, g[i].side, g[j].side); c != nil {
-				return fileDecisions{conflict: c}
+			ci, cj, ev := conflictingHunkPairs(g[i].ch, g[j].ch, g[i].side, g[j].side)
+			if len(ev) == 0 {
+				continue
+			}
+			for idx := range ci {
+				conflicted[i][idx] = true
+			}
+			for idx := range cj {
+				conflicted[j][idx] = true
+			}
+			evidence = append(evidence, ev...)
+			if !hasConflict {
+				hasConflict = true
+				firstA, firstB = i, j
+				firstHunk = [2]model.Hunk{g[i].ch.Hunks[firstKey(ci)], g[j].ch.Hunks[firstKey(cj)]}
 			}
 		}
 	}
-	// Disjoint hunks: auto-apply each side.
-	var out fileDecisions
-	for _, sc := range g {
-		out.applied = append(out.applied, model.AppliedChange{
-			SourceID: sc.side, Path: sc.ch.Path, Op: sc.ch.Op})
+	if !hasConflict {
+		// Disjoint hunks: auto-apply each side.
+		return fileDecisions{accepted: append([]sideChange(nil), g...)}
 	}
-	return out
+
+	// Partial acceptance: keep every hunk that interferes with nothing.
+	var accepted []sideChange
+	for i, sc := range g {
+		var keep []model.Hunk
+		for hi, h := range sc.ch.Hunks {
+			if !conflicted[i][hi] {
+				keep = append(keep, h)
+			}
+		}
+		if len(keep) > 0 {
+			ch := sc.ch
+			ch.Hunks = keep
+			accepted = append(accepted, sideChange{side: sc.side, ch: ch})
+		}
+	}
+	return fileDecisions{
+		accepted: accepted,
+		conflict: &model.Conflict{
+			Kind: model.ConflictTextOverlap, Path: key,
+			SideA: g[firstA].side, SideB: g[firstB].side,
+			Detail: fmt.Sprintf(
+				"both sides edit base lines [%d,%d] vs [%d,%d]",
+				firstHunk[0].OldStart, firstHunk[0].OldEnd,
+				firstHunk[1].OldStart, firstHunk[1].OldEnd),
+			Evidence: evidence,
+		},
+	}
+}
+
+// firstKey returns the smallest index in a hunk-index set (deterministic).
+func firstKey(set map[int]bool) int {
+	min := -1
+	for k := range set {
+		if min < 0 || k < min {
+			min = k
+		}
+	}
+	return min
 }
 
 func pairEvidence(g []sideChange) []string {
