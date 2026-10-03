@@ -118,14 +118,30 @@ func convertHunk(sh StructuredHunk, ci, hi int) (model.Hunk, error) {
 	if sh.OldStart < 0 || sh.OldEnd < 0 || sh.NewStart < 0 || sh.NewEnd < 0 {
 		return model.Hunk{}, reason("illegal_line_range", "line numbers must be >= 0")
 	}
-	if sh.OldStart > 0 && sh.OldEnd < sh.OldStart {
-		return model.Hunk{}, reason("illegal_line_range", "old_end precedes old_start")
-	}
 	if sh.NewStart > 0 && sh.NewEnd < sh.NewStart {
 		return model.Hunk{}, reason("illegal_line_range", "new_end precedes new_start")
 	}
+	// A hunk is a PURE INSERTION exactly when it carries no old lines: it
+	// inserts NewLines before base line OldStart without modifying or
+	// deleting anything. The anchor form is OldStart==OldEnd; anchor 0 (or
+	// any anchor past the end of file) is legal and clamps to the
+	// beginning (or end) of the base content at apply time.
+	insertion := len(sh.OldLines) == 0
 	oldCount := 0
-	if sh.OldStart > 0 {
+	if insertion {
+		if sh.OldStart != sh.OldEnd {
+			return model.Hunk{}, reason("illegal_line_range",
+				fmt.Sprintf("pure insertion requires old_start == old_end anchor, got [%d,%d]",
+					sh.OldStart, sh.OldEnd))
+		}
+	} else {
+		if sh.OldStart < 1 {
+			return model.Hunk{}, reason("illegal_line_range",
+				"replacement of existing lines requires a 1-based old_start")
+		}
+		if sh.OldEnd < sh.OldStart {
+			return model.Hunk{}, reason("illegal_line_range", "old_end precedes old_start")
+		}
 		oldCount = sh.OldEnd - sh.OldStart + 1
 	}
 	newCount := 0

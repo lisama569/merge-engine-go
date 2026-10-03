@@ -17,6 +17,10 @@ type sideChange struct {
 type fileDecisions struct {
 	applied  []model.AppliedChange
 	conflict *model.Conflict
+	// accept lists the concrete changes to apply to the merged tree when
+	// there is no conflict. Identical changes from several sides appear
+	// only once so application stays idempotent.
+	accept []sideChange
 }
 
 // reconcilePath merges every side's change to one logical file.
@@ -35,8 +39,11 @@ func reconcilePath(key string, group []sideChange, baseExisted bool) fileDecisio
 
 	// Fast path: single side touches this file -> auto-apply.
 	if len(group) == 1 {
-		return fileDecisions{applied: []model.AppliedChange{{
-			SourceID: group[0].side, Path: group[0].ch.Path, Op: group[0].ch.Op}}}
+		return fileDecisions{
+			applied: []model.AppliedChange{{
+				SourceID: group[0].side, Path: group[0].ch.Path, Op: group[0].ch.Op}},
+			accept: []sideChange{group[0]},
+		}
 	}
 
 	// Multi-side: classify by op set.
@@ -51,8 +58,11 @@ func reconcileMulti(key string, g []sideChange, baseExisted bool) fileDecisions 
 
 	// All sides identical (same op + same target) -> dedupe once.
 	if identicalChanges(g) {
-		return fileDecisions{applied: []model.AppliedChange{{
-			SourceID: g[0].side, Path: g[0].ch.Path, Op: g[0].ch.Op}}}
+		return fileDecisions{
+			applied: []model.AppliedChange{{
+				SourceID: g[0].side, Path: g[0].ch.Path, Op: g[0].ch.Op}},
+			accept: []sideChange{g[0]},
+		}
 	}
 
 	switch {
@@ -107,8 +117,11 @@ func addAddConflict(key string, g []sideChange) fileDecisions {
 	}
 	if len(contents) == 1 {
 		// Identical add: apply once, record first side.
-		return fileDecisions{applied: []model.AppliedChange{{
-			SourceID: g[0].side, Path: key, Op: model.OpAdd}}}
+		return fileDecisions{
+			applied: []model.AppliedChange{{
+				SourceID: g[0].side, Path: key, Op: model.OpAdd}},
+			accept: []sideChange{g[0]},
+		}
 	}
 	return fileDecisions{conflict: &model.Conflict{
 		Kind: model.ConflictAddAdd, Path: key,
@@ -172,8 +185,11 @@ func renameFamilyConflict(key string, g []sideChange) fileDecisions {
 	}
 	if len(distinct) == 1 && len(renames) == len(g) {
 		// Every side performs the same rename: idempotent auto-apply.
-		return fileDecisions{applied: []model.AppliedChange{{
-			SourceID: renames[0].side, Path: renames[0].ch.Path, Op: model.OpRename}}}
+		return fileDecisions{
+			applied: []model.AppliedChange{{
+				SourceID: renames[0].side, Path: renames[0].ch.Path, Op: model.OpRename}},
+			accept: []sideChange{renames[0]},
+		}
 	}
 	return fileDecisions{conflict: &model.Conflict{
 		Kind: model.ConflictRenameRename, Path: key,
@@ -205,6 +221,7 @@ func modifyPair(key string, g []sideChange) fileDecisions {
 	for _, sc := range g {
 		out.applied = append(out.applied, model.AppliedChange{
 			SourceID: sc.side, Path: sc.ch.Path, Op: sc.ch.Op})
+		out.accept = append(out.accept, sc)
 	}
 	return out
 }

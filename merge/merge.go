@@ -5,9 +5,15 @@
 //
 //   - Disjoint paths auto-merge.
 //   - Identical changes from multiple sides apply once (replay-safe).
-//   - Overlapping text hunks on the same base lines conflict.
+//   - Overlapping text hunks on the same base lines conflict; pure
+//     insertions (zero-width anchor hunks) at the same anchor conflict
+//     only when their inserted text differs.
 //   - Rename/rename to different targets, rename/delete, modify/delete
 //     and incompatible type changes are explicit conflicts.
+//   - Conflicts never roll back unrelated changes: non-conflicting
+//     changes are always applied to the merged tree, conflicted paths
+//     keep their base content, and OK reports whether any conflict
+//     occurred.
 //   - Merging is pure: MergeSets(base, sides...) is deterministic and
 //     applying the same change sets again changes nothing.
 package merge
@@ -124,6 +130,9 @@ func MergeSets(base *model.Snapshot, sides ...*model.ChangeSet) *model.MergeResu
 	}
 
 	// Pass 2: per-source reconciliation over deterministic key order.
+	// accepted collects the concrete changes that may be applied to the
+	// merged tree; conflicted groups contribute nothing.
+	var accepted []sideChange
 	keys := make([]string, 0, len(bySource))
 	for k := range bySource {
 		keys = append(keys, k)
@@ -139,6 +148,7 @@ func MergeSets(base *model.Snapshot, sides ...*model.ChangeSet) *model.MergeResu
 			continue
 		}
 		result.Applied = append(result.Applied, d.applied...)
+		accepted = append(accepted, d.accept...)
 	}
 
 	// Pass 3: target-path collisions (add/add, rename destination clashes,
@@ -158,18 +168,17 @@ func MergeSets(base *model.Snapshot, sides ...*model.ChangeSet) *model.MergeResu
 			// Drop any applied add/rename already recorded for this target
 			// or its (renamed) source so the merged tree stays conservative.
 			result.Applied = removeAppliedForConflict(result.Applied, c)
+			accepted = removeAcceptedForConflict(accepted, c)
 		}
 	}
 
-	if len(result.Conflicts) == 0 {
-		result.OK = true
-		applyToSnapshot(result.Merged, ordered)
-	} else {
-		result.OK = false
-		// Keep the merged tree equal to the base on conflict: the engine
-		// never silently writes a guessed merge.
-		result.Merged = base.Clone()
-		result.Applied = nil
+	// The non-conflicting part of the input is ALWAYS applied to the merged
+	// tree, even when other paths conflict: one bad path must not roll back
+	// unrelated, cleanly mergeable changes. Conflicted paths keep their
+	// base content because their changes never entered `accepted`.
+	result.OK = len(result.Conflicts) == 0
+	applyAccepted(result.Merged, accepted)
+	if !result.OK {
 		sortConflicts(result.Conflicts)
 	}
 	return result
@@ -246,42 +255,55 @@ func targetCollision(target string, group []sideChange, renameSources map[string
 	}
 }
 
-// applyToSnapshot performs the accepted changes against a clone of base.
-// It is only called when there are zero conflicts.
-func applyToSnapshot(snap *model.Snapshot, sides []*model.ChangeSet) {
+// applyAccepted applies the accepted (non-conflicting, deduplicated)
+// changes to the merged snapshot. The input order is deterministic:
+// changes were collected while iterating sorted path keys, and within one
+// path group sides are sorted by SourceID.
+//
+// All accepted modify hunks for one file are batched and applied to the
+// BASE content of that file in a single pass: hunk coordinates are
+// base-relative, so applying them one change at a time onto already
+// modified content would misplace insertions after line shifts.
+func applyAccepted(snap *model.Snapshot, accepted []sideChange) {
 	if snap.Files == nil {
 		snap.Files = map[string]string{}
 	}
-	// Side order is already deterministic; within one side preserve order.
-	for _, cs := range sides {
-		for _, ch := range cs.Changes {
-			switch ch.Op {
-			case model.OpAdd:
-				snap.Files[ch.Path] = ch.NewContent
-			case model.OpDelete:
+	modHunks := map[string][]model.Hunk{}
+	var modPaths []string
+	for _, sc := range accepted {
+		ch := sc.ch
+		switch ch.Op {
+		case model.OpModify:
+			if _, seen := modHunks[ch.Path]; !seen {
+				modPaths = append(modPaths, ch.Path)
+			}
+			modHunks[ch.Path] = append(modHunks[ch.Path], ch.Hunks...)
+		case model.OpAdd:
+			snap.Files[ch.Path] = ch.NewContent
+		case model.OpDelete:
+			delete(snap.Files, ch.Path)
+		case model.OpRename:
+			cur, ok := snap.Files[ch.OldPath]
+			if ok {
+				delete(snap.Files, ch.OldPath)
+			}
+			if ch.NewContent != "" {
+				cur = ch.NewContent
+			}
+			snap.Files[ch.Path] = cur
+		case model.OpTypeChange:
+			if ch.ChangeType == "file_to_dir" {
 				delete(snap.Files, ch.Path)
-			case model.OpModify:
-				cur := snap.Files[ch.Path]
-				snap.Files[ch.Path] = applyHunks(cur, ch.Hunks)
-			case model.OpRename:
-				cur, ok := snap.Files[ch.OldPath]
-				if ok {
-					delete(snap.Files, ch.OldPath)
-				}
-				if ch.NewContent != "" {
-					cur = ch.NewContent
-				}
-				snap.Files[ch.Path] = cur
-			case model.OpTypeChange:
-				if ch.ChangeType == "file_to_dir" {
-					delete(snap.Files, ch.Path)
-					snap.Files[ch.Path+"/"] = ""
-				} else {
-					delete(snap.Files, ch.Path+"/")
-					snap.Files[ch.Path] = ch.NewContent
-				}
+				snap.Files[ch.Path+"/"] = ""
+			} else {
+				delete(snap.Files, ch.Path+"/")
+				snap.Files[ch.Path] = ch.NewContent
 			}
 		}
+	}
+	sort.Strings(modPaths)
+	for _, p := range modPaths {
+		snap.Files[p] = applyHunks(snap.Files[p], modHunks[p])
 	}
 }
 
@@ -294,6 +316,22 @@ func removeAppliedForConflict(applied []model.AppliedChange, c *model.Conflict) 
 			}
 		}
 		out = append(out, a)
+	}
+	return out
+}
+
+// removeAcceptedForConflict drops accepted changes whose post-image path
+// collides with a target-collision conflict, mirroring
+// removeAppliedForConflict for the to-apply list.
+func removeAcceptedForConflict(accepted []sideChange, c *model.Conflict) []sideChange {
+	out := accepted[:0]
+	for _, sc := range accepted {
+		if sc.side == c.SideA || sc.side == c.SideB {
+			if sc.ch.Path == c.Path || sc.ch.OldPath == c.Path {
+				continue
+			}
+		}
+		out = append(out, sc)
 	}
 	return out
 }
